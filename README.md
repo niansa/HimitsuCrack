@@ -1,0 +1,2 @@
+# HimitsuCrack
+Dynamic HimitsuShell deobfuscator
