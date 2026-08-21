@@ -26,51 +26,38 @@ static const char *SIGNATURES[] = {
 
 #define NUM_SIGS (sizeof(SIGNATURES) / sizeof(SIGNATURES[0]))
 
-// Wait for unpacking phase, monitoring for early exit
-static int wait_or_check_child(pid_t pid, int timeout_ms) {
-    struct timespec step = {0, 5 * 1000000L}; // 5ms steps
-    int elapsed = 0;
-
-    while (elapsed < timeout_ms) {
-        int status;
-        // WNOHANG returns 0 if child is still running
-        if (waitpid(pid, &status, WNOHANG) == pid) {
-            printf("[!] Child process %d exited prematurely.\n", pid);
-            return -1; 
-        }
-        nanosleep(&step, NULL);
-        elapsed += 5;
-    }
-    return 0;
-}
-
-void extract_and_dump_script(pid_t pid) {
+int attempt_extraction(pid_t pid) {
     char maps_path[64], mem_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
 
     FILE *maps_file = fopen(maps_path, "r");
     int mem_fd = open(mem_path, O_RDONLY);
-    
+
     if (!maps_file || mem_fd < 0) {
-        perror("[-] Failed to open /proc files (try running with sudo)");
         if (maps_file) fclose(maps_file);
         if (mem_fd >= 0) close(mem_fd);
-        return;
+        return -1;
     }
 
-    char line[256];
-    int extracted_count = 0;
+    char line[512];
+    int found = 0;
 
     while (fgets(line, sizeof(line), maps_file)) {
-        unsigned long start, end;
-        char perms[5];
+        unsigned long start, end, inode = 0;
+        char perms[5] = {0};
+        char path[256] = "";
 
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
-        if (perms[0] != 'r') continue; // Readable regions only
+        int parsed = sscanf(line, "%lx-%lx %4s %*x %*s %lu %255s",
+                            &start, &end, perms, &inode, path);
+
+        if (parsed < 4 || perms[0] != 'r') continue;
+
+        if (inode != 0 && strstr(path, "memfd:") == NULL && strstr(path, "(deleted)") == NULL)
+            continue;
 
         size_t size = end - start;
-        if (size > 1024 * 1024 * 256) continue; // Skip mappings > 256MB
+        if (size > 1024 * 1024 * 256) continue;
 
         char *buffer = malloc(size);
         if (!buffer) continue;
@@ -89,40 +76,64 @@ void extract_and_dump_script(pid_t pid) {
             }
 
             if (match) {
-                // Calculate script length: stop at first null byte (\0)
-                char *script_start = (char *)match;
-                size_t script_len = 0;
-                size_t max_len = bytes_read - (script_start - buffer);
-                
-                while (script_len < max_len && script_start[script_len] != '\0') {
-                    script_len++;
+                size_t offset = (char *)match - buffer;
+                size_t last_len = 0;
+                int stable_count = 0;
+
+                printf("[+] Signature match (\"%s\") in dynamic region 0x%lx\n", matched_sig, start);
+                printf("[*] Unpacking detected. Waiting for memory to stabilize...\n");
+
+                while (stable_count < 5) {
+                    usleep(2000);
+
+                    ssize_t fresh_read = pread(mem_fd, buffer, size, start);
+                    if (fresh_read <= 0) break;
+
+                    char *script_start = buffer + offset;
+                    size_t max_len = fresh_read - offset;
+                    size_t current_len = 0;
+
+                    while (current_len < max_len && script_start[current_len] != '\0')
+                        current_len++;
+
+                    if (current_len != last_len) {
+                        stable_count = 0;
+                        last_len = current_len;
+                    } else if (current_len > 0) {
+                        stable_count++;
+                    }
                 }
 
-                printf("[+] Signature match (\"%s\") in region 0x%lx\n", matched_sig, start);
+                char *final_script_start = buffer + offset;
+                size_t final_len = last_len;
 
                 char dump_filename[128];
                 snprintf(dump_filename, sizeof(dump_filename), "extracted_%d.sh", pid);
 
                 FILE *dump_file = fopen(dump_filename, "wb");
                 if (dump_file) {
-                    fwrite(script_start, 1, script_len, dump_file);
+                    fwrite(final_script_start, 1, final_len, dump_file);
                     fclose(dump_file);
-                    printf("    -> Cleanly extracted %zu bytes to %s\n", script_len, dump_filename);
-                    extracted_count++;
+                    printf("    -> Extracted %zu bytes to %s\n", final_len, dump_filename);
+                    found = 1;
                 } else {
                     perror("[-] Failed to write dump file");
                 }
             }
         }
         free(buffer);
-    }
-
-    if (extracted_count == 0) {
-        printf("[-] No target signatures identified in process memory.\n");
+        if (found) break;
     }
 
     close(mem_fd);
     fclose(maps_file);
+    return found;
+}
+
+long long current_time_ms() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 int main(int argc, char *argv[]) {
@@ -139,33 +150,43 @@ int main(int argc, char *argv[]) {
     }
 
     if (pid == 0) {
-        // Child Process
         execvp(argv[1], &argv[1]);
         perror("[-] Exec failed");
         exit(1);
     } else {
-        // Parent Process
         printf("[*] Spawned child process PID: %d\n", pid);
-        printf("[*] Waiting up to 10 ms for unpacking phase...\n");
+        printf("[*] Polling memory for signatures...\n");
 
-        if (wait_or_check_child(pid, 10) == 0) {
-            printf("[*] Sending SIGSTOP to pause execution...\n");
-            kill(pid, SIGSTOP);
-            
-            // Wait for child to enter stopped state
+        long long start_ms = current_time_ms();
+        long long timeout_ms = 2000;
+        struct timespec sleep_step = {0, 1000000L};
+        int extracted = 0;
+
+        while (current_time_ms() - start_ms < timeout_ms) {
             int status;
-            waitpid(pid, &status, WUNTRACED);
-            if (WIFSTOPPED(status)) {
-                printf("[*] Process paused. Scanning memory...\n");
-                extract_and_dump_script(pid);
-            } else {
-                fprintf(stderr, "[-] Target did not stop properly.\n");
+            if (waitpid(pid, &status, WNOHANG) == pid) {
+                printf("[!] Target process exited before payload was found.\n");
+                break;
             }
+
+            int result = attempt_extraction(pid);
+            if (result == 1) {
+                extracted = 1;
+                break;
+            } else if (result == -1) {
+                break;
+            }
+
+            nanosleep(&sleep_step, NULL);
         }
 
-        printf("[*] Terminating target process PID %d...\n", pid);
+        if (extracted) 
+            printf("[*] Extraction successful. Terminating target PID %d...\n", pid);
+        else 
+            printf("[-] Timeout or process exit reached. Terminating target PID %d...\n", pid);
+
         kill(pid, SIGKILL);
-        waitpid(pid, NULL, 0); // Clean up zombie
+        waitpid(pid, NULL, 0);
         printf("[*] Done.\n");
     }
 
