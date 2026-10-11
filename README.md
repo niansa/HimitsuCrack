@@ -2,6 +2,8 @@
 
 Dynamic HimitsuShell deobfuscator
 
+Currently works up to HimitsuShell v1.2.0.
+
 ## Usage
 
 1. Compile: `gcc HimitsuCrack.c -o HimitsuCrack`
